@@ -1,0 +1,227 @@
+import requests
+from bs4 import BeautifulSoup
+from nltk.tokenize import sent_tokenize, word_tokenize
+from nltk.probability import FreqDist
+from nltk.corpus import stopwords
+import nltk
+import threading
+
+# Download necessary NLTK resources (only needed the first time)
+nltk.download('punkt')
+nltk.download('stopwords')
+
+API_KEY = "AIzaSyBoZomxweCXtqrn7mlYXfHWPKfZR4VhNc0"
+CSE_ID = "d062581b6a1c544f3"
+
+def fetch_web_page(url):
+    """Fetches plain text content from a web page."""
+    try:
+        response = requests.get(url, timeout=10)
+        response.raise_for_status()
+        soup = BeautifulSoup(response.text, 'html.parser')
+
+        # Remove script and style elements
+        for script_or_style in soup(['script', 'style']):
+            script_or_style.decompose()
+
+        return soup.get_text(separator=' ', strip=True)
+    except Exception as e:
+        print(f"Error fetching {url}: {e}")
+        return None
+
+def summarize_content(content, max_len=300):
+    """Summarizes content to a fixed word count."""
+    words = content.split()
+    return ' '.join(words[:max_len])
+
+def search_trusted_sources(keyword, num_results=10):
+    """Searches for trusted sources using Google Custom Search API."""
+    url = f"https://www.googleapis.com/customsearch/v1?q={keyword}&key={API_KEY}&cx={CSE_ID}&num={num_results}"
+    results = []
+    try:
+        response = requests.get(url)
+        response.raise_for_status()
+        data = response.json()
+        results = [
+            {
+                'link': item['link'],
+                'title': item.get('title', 'N/A'),
+                'description': item.get('snippet', 'N/A'),
+                'publisher': item.get('displayLink', 'N/A')
+            }
+            for item in data.get('items', [])
+        ]
+        return results
+    except Exception as e:
+        print(f"Error during Google Search: {e}")
+        return []
+
+def extract_publication_date(url):
+    """Extracts the publication date from the webpage."""
+    try:
+        response = requests.get(url, timeout=10)
+        response.raise_for_status()
+        soup = BeautifulSoup(response.text, 'html.parser')
+
+        # Look for common metadata tags
+        meta_date = (soup.find('meta', {'name': 'date'}) or
+                     soup.find('meta', {'property': 'article:published_time'}) or
+                     soup.find('meta', {'property': 'og:published_time'}) or
+                     soup.find('meta', {'property': 'datePublished'}) or
+                     soup.find('meta', {'name': 'pubdate'}) or
+                     soup.find('time'))
+
+        if meta_date:
+            date_content = meta_date.get('content') or meta_date.text
+            if date_content:
+                return date_content.strip()
+
+        # If no meta tag is found, search the visible text for date patterns
+        text = soup.get_text()
+        date_patterns = [
+            r'\b\d{4}-\d{2}-\d{2}\b',  # Matches YYYY-MM-DD
+            r'\b\d{2}/\d{2}/\d{4}\b',  # Matches DD/MM/YYYY
+            r'\b\d{2}-\d{2}-\d{4}\b',  # Matches DD-MM-YYYY
+            r'\b\d{4}/\d{2}/\d{2}\b'   # Matches YYYY/MM/DD
+        ]
+        for pattern in date_patterns:
+            match = re.search(pattern, text)
+            if match:
+                return match.group()
+
+        return 'N/A'  # Return N/A if no date is found
+    except Exception as e:
+        print(f"Error extracting date from {url}: {e}")
+        return 'N/A'
+
+def calculate_similarity(content1, content2):
+    """Calculates semantic similarity between two pieces of text."""
+    try:
+        embeddings1 = MODEL.encode(content1, convert_to_tensor=True)
+        embeddings2 = MODEL.encode(content2, convert_to_tensor=True)
+        similarity = util.pytorch_cos_sim(embeddings1, embeddings2)
+        return similarity.item()
+    except Exception as e:
+        print(f"Error calculating similarity: {e}")
+        return 0
+
+def scale_similarity_to_100(similarity):
+    """Scales similarity from [-1, 1] to [1, 100]."""
+    normalized_score = (similarity + 1) / 2  # Normalize to [0, 1]
+    return normalized_score * 99 + 1  # Scale to [1, 100]
+
+def process_trusted_source(trusted_url, summarized_content, results):
+    """Processes a trusted source to compute similarity with the main content."""
+    try:
+        trusted_content = fetch_web_page(trusted_url)
+        if trusted_content:
+            trusted_summary = summarize_content(trusted_content)
+            similarity = calculate_similarity(summarized_content, trusted_summary)
+            scaled_score = scale_similarity_to_100(similarity)
+            results.append((trusted_url, scaled_score))
+        else:
+            results.append((trusted_url, 1))  # Minimum score for no content
+    except Exception as e:
+        print(f"Error processing {trusted_url}: {e}")
+        results.append((trusted_url, 1))  # Minimum score for errors
+
+def fetch_content_from_url(url):
+    """Fetches content from the given URL."""
+    try:
+        headers = {
+            "User-Agent": "Mozilla/5.0"
+        }
+        response = requests.get(url, headers=headers, timeout=10)
+        response.raise_for_status()
+        soup = BeautifulSoup(response.content, "html.parser")
+        paragraphs = soup.find_all("p")
+        content = " ".join(para.get_text().strip() for para in paragraphs if para.get_text().strip())
+        return content if content else None
+    except Exception as e:
+        print(f"Error fetching the URL: {e}")
+        return None
+
+def rank_sentences_by_importance(content, keyword):
+    """Summarizes content by ranking sentences based on word frequency."""
+    sentences = sent_tokenize(content)
+    if not sentences:
+        print("No meaningful content to summarize.")
+        return []
+
+    # Tokenize and remove stopwords
+    stop_words = set(stopwords.words("english"))
+    words = [word for word in word_tokenize(content.lower()) if word.isalnum() and word not in stop_words]
+    freq_dist = FreqDist(words)
+
+    # Rank sentences based on cumulative word frequency
+    sentence_scores = {
+        sentence: sum(freq_dist[word] for word in word_tokenize(sentence.lower()) if word in freq_dist)
+        for sentence in sentences
+    }
+
+    # Normalize scores by sentence length to avoid bias toward longer sentences
+    sentence_scores = {k: v / len(k.split()) for k, v in sentence_scores.items()}
+
+    # Sort by descending score and select top 10 sentences
+    ranked_sentences = sorted(sentence_scores, key=sentence_scores.get, reverse=True)
+    return ranked_sentences[:10]
+
+def main():
+    """Main function to fetch content from a URL and summarize it."""
+    keyword = "healthcare"  # Automatically set for demonstration purposes
+    priyanshu = "https://example.com"  # Automatically set URL for demonstration purposes
+
+    print(f"Searching trusted sources for keyword: {keyword}")
+    search_results = search_trusted_sources(keyword)
+    if not search_results:
+        print("No trusted sources found.")
+        return
+
+    print(f"Found {len(search_results)} trusted sources.")
+    table_data = []
+    threads = []
+    results = []
+
+    for idx, result in enumerate(search_results):
+        url = result['link']
+        title = result['title']
+        description = result['description']
+        publisher = result['publisher']
+        publication_date = extract_publication_date(url)
+        thread = threading.Thread(target=process_trusted_source, args=(url, description, results))
+        threads.append(thread)
+        thread.start()
+        table_data.append({
+            'Serial No.': idx + 1,
+            'Title': title,
+            'Description': description,
+            'Publisher': publisher,
+            'Publication Date': publication_date,
+            'Source Link': url
+        })
+
+    for thread in threads:
+        thread.join()
+    for i, (_, score) in enumerate(results):
+        table_data[i]['Accuracy'] = score
+
+    df = pd.DataFrame(table_data)
+    df['Accuracy'] = pd.to_numeric(df['Accuracy'], errors='coerce')
+    df.sort_values(by='Accuracy', ascending=False, inplace=True)
+    most_accurate = df.iloc[0]['Source Link']
+    print(f"\nMost accurate source: {most_accurate}")
+
+    content = fetch_content_from_url(most_accurate)
+    if content:
+        print(f"\nSummary of Keyword: {keyword}")
+        summary = rank_sentences_by_importance(content, keyword)
+        for i, point in enumerate(summary, 1):
+            print(f"{i}. {point}")
+    else:
+        print("Failed to retrieve content for the most accurate source.")
+
+    print("\nGenerated Table (Sorted by Accuracy):")
+    print(df)
+
+if __name__ == "__main__":
+    main()
